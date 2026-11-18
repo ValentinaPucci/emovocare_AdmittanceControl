@@ -11,15 +11,17 @@ How it works:
      position limits are needed, so it does not matter where the motor's zero is.
   3. The flex sensor is read continuously (code reused from flex_sensors/).
   4. When the trigger fires, the sensor is NOT read while the motor moves (the motor
-     itself bends the sensor). After the move the sensor settles, the old samples are
-     discarded, and the trigger is re-armed in the OPPOSITE direction.
+     itself bends the sensor). After the move the sensor settles and is ZEROED: its
+     dR/R0 at that moment becomes the new baseline. The next trigger fires only when
+     dR/R0 moves --trig percent away from that baseline, in the OPPOSITE direction.
+     Keep the finger still for ~1 s after each move while the baseline is measured.
 
 Place this file at the repo root, next to the flex_sensors/ and motor/ folders.
 
 Examples:
-    python flex_triggered_motor.py --start open --trig -20
-    python flex_triggered_motor.py --start closed --trig 20
-    python flex_triggered_motor.py --start open --trig -20 --saved-flat
+    python flex_triggered_motor.py --start open --trig 20
+    python flex_triggered_motor.py --start closed --trig -20
+    python flex_triggered_motor.py --start open --trig 20 --saved-flat
     Ctrl+C stops the script and turns the motor torque OFF.
 """
 import argparse
@@ -37,8 +39,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "flex_sensors" / "scripts"))
 sys.path.insert(0, str(ROOT / "flex_sensors"))
 
-from flex_shape import (DeltaTrigger,      # fires when dR/R0 moves by DELTA percent
-                        open_port,         # opens the Nano 33 IoT serial port
+from flex_shape import (open_port,         # opens the Nano 33 IoT serial port
                         read_resistance,   # reads one resistance sample [ohm]
                         resolve_r0)        # flat-sensor resistance (zero now, or saved)
 
@@ -55,7 +56,8 @@ PROFILE_VELOCITY = 20    # max speed of the movement (1 unit = 0.229 rpm)
 MOVE_DISTANCE = 1200     # ticks between OPEN and CLOSED (closing = position decreases)
 TOLERANCE = 15           # ticks: "target reached"
 MOVE_TIMEOUT = 15        # seconds: give up waiting for the target
-SETTLE_S = 0.5           # seconds to let the sensor settle after the motor stops
+SETTLE_S = 1.0           # seconds to let the sensor settle after the motor stops
+BASELINE_S = 1.0         # seconds averaged to zero the sensor (keep the finger still)
 
 # Dynamixel control table addresses (X series, protocol 2.0)
 ADDR_OPERATING_MODE = 11
@@ -173,6 +175,19 @@ def move_to(target):
     return False
 
 
+# ------------------------- SENSOR ZEROING -------------------------
+def measure_baseline(ser, R0):
+    """Wait for the sensor to settle, then average dR/R0 [%] for BASELINE_S. This is the new zero."""
+    time.sleep(SETTLE_S)
+    ser.reset_input_buffer()                             # drop everything read/buffered during the move
+    vals, t_end = [], time.time() + BASELINE_S
+    while time.time() < t_end or len(vals) < 5:
+        r = read_resistance(ser)
+        if r is not None:
+            vals.append(r)
+    return (statistics.mean(vals) - R0) / R0 * 100.0
+
+
 # ------------------------- MAIN -------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -180,7 +195,7 @@ def main():
     ap.add_argument("--start", choices=["open", "closed"], required=True,
                     help="is the finger OPEN or CLOSED when the script starts?")
     ap.add_argument("--trig", type=float, default=-20.0,
-                    help="first trigger: dR/R0 moves this many percent from its recent extreme "
+                    help="first trigger: dR/R0 moves this many percent away from the zeroed baseline "
                          "(positive = rising, negative = falling). The direction flips after each move.")
     ap.add_argument("--smooth", type=int, default=5, help="moving-average window in samples")
     ap.add_argument("--saved-flat", action="store_true",
@@ -202,9 +217,10 @@ def main():
     print(f"Starting {args.start.upper()}: open = {open_pos}, closed = {closed_pos}")
 
     delta = args.trig
-    trig = DeltaTrigger(delta)
     win = deque(maxlen=args.smooth)
-    print(f"\nWatching the flex sensor (trigger at {delta:+.1f} % dR/R0). Ctrl+C to stop.\n")
+    print("\nKeep the finger still, zeroing the sensor...")
+    baseline = measure_baseline(ser, R0)                 # dR/R0 [%] that counts as "no movement"
+    print(f"Baseline dR/R0 = {baseline:+.2f} %. Watching for {delta:+.1f} % from it. Ctrl+C to stop.\n")
 
     try:
         while True:
@@ -215,10 +231,12 @@ def main():
             R = statistics.mean(win)
             x_pct = (R - R0) / R0 * 100.0                # dR/R0 in percent
 
-            print(f"\rdR/R0 = {x_pct:+6.2f} %   ", end="", flush=True)
+            change = x_pct - baseline                    # movement since the last zero [% points]
+            print(f"\rdR/R0 = {x_pct:+6.2f} %   change from zero = {change:+6.2f} %   ", end="", flush=True)
 
-            if trig.update(x_pct):
-                print(f"\n>>> TRIGGER  dR/R0 = {x_pct:+.2f} %")
+            # fire when the change reaches |delta| in the chosen direction (negative delta = falling)
+            if (change >= delta) if delta > 0 else (change <= delta):
+                print(f"\n>>> TRIGGER  change = {change:+.2f} %  (dR/R0 = {x_pct:+.2f} %)")
                 if is_open:
                     print(f"  open -> closing to {closed_pos}")
                     moved = move_to(closed_pos)          # the sensor is NOT read while the motor moves
@@ -226,14 +244,14 @@ def main():
                     print(f"  closed -> opening to {open_pos}")
                     moved = move_to(open_pos)
 
-                time.sleep(SETTLE_S)                     # let the sensor settle at the new curvature
-                ser.reset_input_buffer()                 # drop samples that piled up during the move
-                win.clear()
                 if moved:
                     is_open = not is_open
                     delta = -delta                       # now watch for the opposite movement
-                    print(f"  now {'OPEN' if is_open else 'CLOSED'}; watching for {delta:+.1f} %")
-                trig = DeltaTrigger(delta)               # fresh reference at the new curvature
+                win.clear()
+                print("  keep the finger still, zeroing the sensor...")
+                baseline = measure_baseline(ser, R0)     # ZERO at the new curvature
+                print(f"  now {'OPEN' if is_open else 'CLOSED'}; baseline = {baseline:+.2f} %, "
+                      f"watching for {delta:+.1f} % from it")
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
