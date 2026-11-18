@@ -19,8 +19,7 @@ in the chosen direction. It only prints a message for now.
 Examples:
     python scripts/flex_shape.py flat                      # once, sensor flat
     python scripts/flex_shape.py live --saved-flat         # starts bent, uses saved R0
-    python scripts/flex_shape.py live --start-angle 90     # starts at a known 90 deg
-    python scripts/flex_shape.py live --saved-flat --trig-rate 2 --trig-dir up --trig-window 0.1
+    python scripts/flex_shape.py live --saved-flat --trig 50
     python scripts/flex_plot.py --saved-flat
 """
 from __future__ import annotations
