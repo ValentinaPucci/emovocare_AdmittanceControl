@@ -12,15 +12,18 @@ How it works:
   3. The flex sensor is read continuously (code reused from flex_sensors/).
   4. When the trigger fires, the sensor is NOT read while the motor moves (the motor
      itself bends the sensor). After the move the sensor settles and is ZEROED: its
-     dR/R0 at that moment becomes the new baseline. The next trigger fires only when
-     dR/R0 moves --trig percent away from that baseline, in the OPPOSITE direction.
-     Keep the finger still for ~1 s after each move while the baseline is measured.
+     resistance becomes the new reference, so dR/R0 goes back to 0 %. The next trigger
+     fires when dR/R0 reaches +|--trig| % from that zero to close, or -|--trig| % to open.
+     Keep the finger still for a few seconds after each move (SETTLE_S + BASELINE_S).
+  5. If the motor stalls before reaching the target (timeout) but got within
+     (1 - DONE_FRACTION) * MOVE_DISTANCE ticks of it, the move still counts as done
+     and the direction flips. This works in both directions and for any start position.
 
 Place this file at the repo root, next to the flex_sensors/ and motor/ folders.
 
 Examples:
     python flex_triggered_motor.py --start open --trig 20
-    python flex_triggered_motor.py --start closed --trig -20
+    python flex_triggered_motor.py --start closed --trig 20
     python flex_triggered_motor.py --start open --trig 20 --saved-flat
     Ctrl+C stops the script and turns the motor torque OFF.
 """
@@ -52,16 +55,19 @@ MOTOR_PORT = (glob.glob("/dev/cu.usbserial*") or [None])[0]   # same auto-detect
 
 MAX_CURRENT = 100        # current limit (raw units, 1 unit = 2.69 mA) -> ~269 mA
 PROFILE_VELOCITY = 20    # max speed of the movement (1 unit = 0.229 rpm)
+POSITION_P_GAIN = 300    # position P gain (default 800)
 
 MOVE_DISTANCE = 1200     # ticks between OPEN and CLOSED (closing = position decreases)
 TOLERANCE = 15           # ticks: "target reached"
+DONE_FRACTION = 0.75     # on timeout, a move that covered this fraction of MOVE_DISTANCE counts as done
 MOVE_TIMEOUT = 15        # seconds: give up waiting for the target
-SETTLE_S = 1.0           # seconds to let the sensor settle after the motor stops
-BASELINE_S = 1.0         # seconds averaged to zero the sensor (keep the finger still)
+SETTLE_S = 3.0           # seconds to wait after the motor stops before zeroing (sensor settles)
+BASELINE_S = 1.5         # seconds averaged to zero the sensor (keep the finger still)
 
 # Dynamixel control table addresses (X series, protocol 2.0)
 ADDR_OPERATING_MODE = 11
 ADDR_TORQUE_ENABLE = 64
+ADDR_POSITION_P_GAIN = 84
 ADDR_HARDWARE_ERROR = 70
 ADDR_GOAL_CURRENT = 102
 ADDR_PROFILE_VELOCITY = 112
@@ -76,12 +82,15 @@ pk = PacketHandler(2.0)
 def write(address, value, n_bytes):
     """Write a register and return True if the motor acknowledged it without error."""
     fn = {1: pk.write1ByteTxRx, 2: pk.write2ByteTxRx, 4: pk.write4ByteTxRx}[n_bytes]
+    result, error = None, None
     for _ in range(5):                                   # a few retries against noise
         result, error = fn(ph, MOTOR_ID, address, value)
         if result == COMM_SUCCESS and (error & 0x7F) == 0:
             return True
         time.sleep(0.01)
-    print(f"WRITE FAILED (address {address})")
+    print(f"WRITE FAILED (address {address}, value {value}): "
+          f"comm = {pk.getTxRxResult(result)}, "
+          f"motor error = {pk.getRxPacketError(error) if error else 'none'}")
     return False
 
 
@@ -120,6 +129,7 @@ def setup_motor():
         sys.exit("No /dev/cu.usbserial* port found for the motor.")
     if not ph.openPort() or not ph.setBaudRate(BAUD):
         sys.exit(f"Cannot open the motor port {MOTOR_PORT}")
+    print(f"Motor port: {MOTOR_PORT}")
 
     # If the motor latched a hardware error (overload, voltage...), reboot to clear it.
     hw = hardware_error()
@@ -133,6 +143,7 @@ def setup_motor():
           and write(ADDR_OPERATING_MODE, 5, 1)                 # 5 = current-based position control
           and write(ADDR_GOAL_CURRENT, MAX_CURRENT, 2)         # max current while moving/holding
           and write(ADDR_PROFILE_VELOCITY, PROFILE_VELOCITY, 4)
+          and write(ADDR_POSITION_P_GAIN, POSITION_P_GAIN, 2)  # lower P gain = softer position control
           and write(ADDR_TORQUE_ENABLE, 1, 1))
     if not ok:
         sys.exit("Motor setup failed (check wiring / 12 V power / baud rate / ID).")
@@ -141,7 +152,8 @@ def setup_motor():
     pos = read_position()
     if pos is None or not set_goal(pos):
         sys.exit("Cannot read/hold the present position.")
-    print(f"Motor ready at position {pos} (max current {MAX_CURRENT} = {MAX_CURRENT * 2.69:.0f} mA)")
+    print(f"Motor ready at position {pos} (max current {MAX_CURRENT} = {MAX_CURRENT * 2.69:.0f} mA, "
+          f"position P gain {POSITION_P_GAIN})")
     return pos
 
 
@@ -155,7 +167,8 @@ def release_motor():
 
 def move_to(target):
     """Send the motor to `target` and block until it arrives (or timeout).
-    Returns True if the target was reached."""
+    Returns True if the target was reached, or if the motor stalled within
+    (1 - DONE_FRACTION) * MOVE_DISTANCE ticks of it (counted as done)."""
     if not set_goal(target):
         return False
     t0 = time.time()
@@ -164,20 +177,34 @@ def move_to(target):
         if pos is not None and abs(pos - target) <= TOLERANCE:
             print("  target reached")
             return True
+        time.sleep(0.02)                                 # don't hammer the bus with back-to-back reads
+
     # Timeout: hold where we are instead of continuing to pull.
     hw = hardware_error()
     if hw:
         print(f"  motor hardware error status = {hw:#010b} (check the 12 V supply, not USB only)")
     pos = read_position()
-    if pos is not None:
-        set_goal(pos)
-    print("  target NOT reached (timeout) -> holding current position")
+    print(f"  stopped at {pos}, target {target}")
+    if pos is None:
+        print("  could not read the position -> move NOT counted")
+        return False
+    set_goal(pos)
+
+    remaining = abs(pos - target)
+    max_remaining = (1.0 - DONE_FRACTION) * MOVE_DISTANCE
+    if remaining <= max_remaining:
+        print(f"  target not reached ({remaining} ticks short) but within {max_remaining:.0f} "
+              f"-> counted as done")
+        return True
+    print(f"  target NOT reached ({remaining} ticks short, more than {max_remaining:.0f}) "
+          f"-> holding current position")
     return False
 
 
 # ------------------------- SENSOR ZEROING -------------------------
-def measure_baseline(ser, R0):
-    """Wait for the sensor to settle, then average dR/R0 [%] for BASELINE_S. This is the new zero."""
+def measure_zero(ser):
+    """Wait for the sensor to settle, then average the resistance [ohm] for BASELINE_S.
+    This becomes the new reference: dR/R0 is 0 % at this resistance."""
     time.sleep(SETTLE_S)
     ser.reset_input_buffer()                             # drop everything read/buffered during the move
     vals, t_end = [], time.time() + BASELINE_S
@@ -185,7 +212,7 @@ def measure_baseline(ser, R0):
         r = read_resistance(ser)
         if r is not None:
             vals.append(r)
-    return (statistics.mean(vals) - R0) / R0 * 100.0
+    return statistics.mean(vals)
 
 
 # ------------------------- MAIN -------------------------
@@ -194,9 +221,9 @@ def main():
     ap.add_argument("-p", "--port", help="flex sensor (Nano 33 IoT) serial port; auto-detected if omitted")
     ap.add_argument("--start", choices=["open", "closed"], required=True,
                     help="is the finger OPEN or CLOSED when the script starts?")
-    ap.add_argument("--trig", type=float, default=-20.0,
-                    help="first trigger: dR/R0 moves this many percent away from the zeroed baseline "
-                         "(positive = rising, negative = falling). The direction flips after each move.")
+    ap.add_argument("--trig", type=float, default=20.0,
+                    help="trigger size in percent (sign ignored): dR/R0 rises by this much from zero "
+                         "to close the finger, and falls by this much from zero to open it.")
     ap.add_argument("--smooth", type=int, default=5, help="moving-average window in samples")
     ap.add_argument("--saved-flat", action="store_true",
                     help="use the flat R0 saved by 'flex_shape.py flat' instead of zeroing now")
@@ -204,6 +231,7 @@ def main():
 
     # 1) Flex sensor: open the port and get the flat resistance R0
     ser = open_port(args.port)
+    print(f"Flex sensor port: {ser.port}")
     print("Using saved R0" if args.saved_flat else "Keep the flex sensor FLAT and still while zeroing...")
     R0 = resolve_r0(ser, None, saved_flat=args.saved_flat)
     print(f"Flat R0 = {R0 / 1000:.3f} kOhm")
@@ -216,11 +244,12 @@ def main():
     closed_pos = start - MOVE_DISTANCE if is_open else start
     print(f"Starting {args.start.upper()}: open = {open_pos}, closed = {closed_pos}")
 
-    delta = args.trig
+    mag = abs(args.trig)                                 # trigger size [%]: +mag to close, -mag to open
     win = deque(maxlen=args.smooth)
     print("\nKeep the finger still, zeroing the sensor...")
-    baseline = measure_baseline(ser, R0)                 # dR/R0 [%] that counts as "no movement"
-    print(f"Baseline dR/R0 = {baseline:+.2f} %. Watching for {delta:+.1f} % from it. Ctrl+C to stop.\n")
+    R_ref = measure_zero(ser)                            # dR/R0 = 0 % at this resistance
+    print(f"Zeroed at {R_ref / 1000:.3f} kOhm. Close at dR/R0 = {+mag:+.1f} %, "
+          f"open at {-mag:+.1f} %. Ctrl+C to stop.\n")
 
     try:
         while True:
@@ -229,14 +258,13 @@ def main():
                 continue
             win.append(r)
             R = statistics.mean(win)
-            x_pct = (R - R0) / R0 * 100.0                # dR/R0 in percent
+            x_pct = (R - R_ref) / R_ref * 100.0          # dR/R0 in percent, relative to the last zero
 
-            change = x_pct - baseline                    # movement since the last zero [% points]
-            print(f"\rdR/R0 = {x_pct:+6.2f} %   change from zero = {change:+6.2f} %   ", end="", flush=True)
+            print(f"\rdR/R0 = {x_pct:+6.2f} %   ", end="", flush=True)
 
-            # fire when the change reaches |delta| in the chosen direction (negative delta = falling)
-            if (change >= delta) if delta > 0 else (change <= delta):
-                print(f"\n>>> TRIGGER  change = {change:+.2f} %  (dR/R0 = {x_pct:+.2f} %)")
+            # OPEN -> CLOSED fires when dR/R0 rises to +mag; CLOSED -> OPEN when it falls to -mag
+            if (x_pct >= mag) if is_open else (x_pct <= -mag):
+                print(f"\n>>> TRIGGER  dR/R0 = {x_pct:+.2f} %")
                 if is_open:
                     print(f"  open -> closing to {closed_pos}")
                     moved = move_to(closed_pos)          # the sensor is NOT read while the motor moves
@@ -246,12 +274,11 @@ def main():
 
                 if moved:
                     is_open = not is_open
-                    delta = -delta                       # now watch for the opposite movement
                 win.clear()
                 print("  keep the finger still, zeroing the sensor...")
-                baseline = measure_baseline(ser, R0)     # ZERO at the new curvature
-                print(f"  now {'OPEN' if is_open else 'CLOSED'}; baseline = {baseline:+.2f} %, "
-                      f"watching for {delta:+.1f} % from it")
+                R_ref = measure_zero(ser)                # dR/R0 goes back to 0 % at the new curvature
+                print(f"  now {'OPEN' if is_open else 'CLOSED'}; zeroed at {R_ref / 1000:.3f} kOhm, "
+                      f"watching for dR/R0 = {(mag if is_open else -mag):+.1f} %")
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
