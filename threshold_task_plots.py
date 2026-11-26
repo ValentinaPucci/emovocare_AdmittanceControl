@@ -324,7 +324,7 @@ def main():
     cv = tk.Canvas(left, width=W, height=H, bg="white", highlightthickness=0)
     cv.pack()
     btn = tk.Button(left, text="START  (or press Space / Enter)", font=("Helvetica", 14, "bold"),
-                    bg="#2a9d3a", fg="white", activebackground="#238a31", activeforeground="white",
+                    bg="#2a9d3a", fg= "#2a7f2a", activebackground="#238a31", activeforeground="white",
                     command=lambda: start_task())
     btn.pack(fill="x", pady=2)
     pv = tk.Canvas(left, width=W, height=PERF_H, bg="#fafafa", highlightthickness=0)
